@@ -1,0 +1,5 @@
+PyMuPDF>=1.23.0
+streamlit>=1.30.0
+sentence-transformers>=2.2.0
+faiss-cpu>=1.7.4
+numpy>=1.24.0
