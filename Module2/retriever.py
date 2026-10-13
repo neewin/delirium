@@ -7,6 +7,7 @@ and lets you semantically search for the most relevant chunks.
 """
 
 import os
+import re
 import json
 from typing import List, Dict, Optional
 
@@ -15,6 +16,23 @@ import faiss
 from sentence_transformers import SentenceTransformer
 
 MODEL_NAME = "all-MiniLM-L6-v2"
+
+# Hybrid search settings
+CANDIDATE_POOL = 20      # how many passages the embedding search shortlists
+SEMANTIC_WEIGHT = 0.6    # final score = 0.6 * meaning match + 0.4 * keyword match
+_STOPWORDS = set(
+    "a an the of to in on for and or but is are was were be been it its this that these "
+    "those with as by at from your you we they he she not no all any can may will has have "
+    "had do does did who which what when where how also than then so such into over about "
+    "explain describe define tell give list discuss mention summarize summarise please "
+    "me us my our their there here".split())
+
+
+def _keywords(text: str) -> set:
+    """Lowercase content words (stopwords removed, crude plural stripping)."""
+    words = re.findall(r"[a-z0-9]+", text.lower())
+    return {w[:-1] if len(w) > 3 and w.endswith("s") else w
+            for w in words if w not in _STOPWORDS}
 
 
 class SemanticRetriever:
@@ -99,14 +117,21 @@ class SemanticRetriever:
         return query_embedding
 
     # -- Part 6 & 7: Search ---------------------------------------------
-    def search(self, query: str, top_k: int = 5) -> List[Dict]:
-        """Return the top_k chunks most similar to the query, with scores.
+    def search(self, query: str, top_k: int = 5, hybrid: bool = True,
+               candidate_pool: int = CANDIDATE_POOL) -> List[Dict]:
+        """Return the top_k chunks most relevant to the query.
 
-        Score is a cosine similarity in [-1, 1] (in practice usually 0-1
-        for natural text): higher means more semantically similar. There
-        is no universal "good" threshold — what counts as relevant depends
-        on the embedding model and the dataset, so treat scores as a
-        relative ranking signal, not an absolute guarantee of correctness.
+        Hybrid mode (default): the embedding search shortlists `candidate_pool`
+        chunks, then they are re-ranked by
+            0.6 * semantic similarity + 0.4 * keyword match.
+        This rescues passages that literally contain the question's key words
+        (e.g. a heading "Types of Reports") but score only slightly lower
+        on meaning. Set hybrid=False for pure embedding search.
+
+        'score' is always the cosine similarity (meaning match, about 0 to 1);
+        it is not a probability and has no universal "good" threshold.
+        'keyword_score' is the fraction of the query's key words found in the
+        chunk; 'hybrid_score' is the value used for ranking.
         """
         if self.index is None:
             raise RuntimeError("Index has not been built or loaded yet.")
@@ -114,22 +139,34 @@ class SemanticRetriever:
             raise ValueError("top_k must be a positive integer.")
 
         query_vector = self.embed_query(query)
-        k = min(top_k, self.index.ntotal)
+        pool = max(top_k, candidate_pool) if hybrid else top_k
+        k = min(pool, self.index.ntotal)
         scores, indices = self.index.search(query_vector, k)
 
+        query_words = _keywords(query)
         results = []
         for score, idx in zip(scores[0], indices[0]):
             if idx == -1:  # FAISS returns -1 when fewer than k results exist
                 continue
             chunk_meta = self.metadata[idx]
+            if query_words:
+                keyword_score = len(query_words & _keywords(chunk_meta["text"])) / len(query_words)
+            else:
+                keyword_score = 0.0
+            semantic = float(score)
             results.append({
                 "chunk_id": chunk_meta["chunk_id"],
                 "source": chunk_meta["source"],
                 "page": chunk_meta["page"],
                 "text": chunk_meta["text"],
-                "score": float(score),
+                "score": semantic,
+                "keyword_score": round(keyword_score, 3),
+                "hybrid_score": SEMANTIC_WEIGHT * semantic + (1 - SEMANTIC_WEIGHT) * keyword_score,
             })
-        return results
+
+        if hybrid:
+            results.sort(key=lambda r: -r["hybrid_score"])
+        return results[:top_k]
 
     # -- Part 8: Save / Load -------------------------------------------
     def save(self, index_path: str, metadata_path: str) -> None:
