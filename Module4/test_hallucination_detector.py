@@ -15,10 +15,8 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))   # project root
 sys.path.insert(0, HERE)
-try:
-    from hallucination_detector import HallucinationDetector, extract_claims, split_passage
-except ModuleNotFoundError:                  # Module4/ folder layout
-    from hallucination_detector import HallucinationDetector, extract_claims, split_passage
+                  # Module4/ folder layout
+from hallucination_detector import HallucinationDetector, extract_claims, split_passage, normalize_acronyms
 
 
 class FakeEmbedder:
@@ -155,6 +153,37 @@ class TestDetector(unittest.TestCase):
         self.assertEqual(len(ev), 1)
         self.assertTrue(ev[0]["text"].startswith("Learning methods include"))
         self.assertNotIn("unsupervised", ev[0]["text"])
+
+    def test_acronym_normalisation(self):
+        n = normalize_acronyms
+        self.assertEqual(n("Subscriber identity module (SIM) cards are usually found."),
+                         "SIM cards are usually found.")
+        self.assertEqual(n("The Federal Bureau of Investigation (FBI) said so."), "The FBI said so.")
+        self.assertEqual(n("SIM (subscriber identity module) cards"), "SIM cards")
+        self.assertEqual(n("Subscriber identity modules (SIMs) differ."), "SIMs differ.")
+        self.assertEqual(n("The model (MD5) hash"), "The model (MD5) hash")      # initials do not match
+        self.assertEqual(n("It works (see Table 2) fine."), "It works (see Table 2) fine.")
+        self.assertEqual(n(""), "")
+
+    def test_nli_receives_normalised_text_but_display_is_original(self):
+        seen = []
+        d = HallucinationDetector(embedder=FakeEmbedder())
+        d._predict_batch = lambda pairs: (seen.extend(pairs), [S(0.95, 0.02, 0.03)] * len(pairs))[1]
+        chunk = dict(CHUNK, text="Portability of information is what makes SIM cards so versatile.")
+        claim = "Portability of information is what makes subscriber identity module (SIM) cards so versatile."
+        r = d.verify_answer("Q?", claim, [chunk])
+        self.assertEqual(r["claims"][0]["claim"], claim)                 # shown unchanged
+        self.assertEqual(r["claims"][0]["status"], "supported")
+        self.assertNotIn("subscriber", seen[0][1])                       # NLI saw the short form
+        self.assertIn("SIM cards", seen[0][1])
+
+    def test_split_before_lowercase_brand_names(self):
+        text = ("SIM cards are similar to standard memory cards, except the connectors differ. "
+                "iPhones and many Android phones have micro SIM slots, but some stay locked.")
+        claims = [c["claim"] for c in extract_claims(text)]
+        self.assertEqual(len(claims), 2)
+        self.assertTrue(claims[1].startswith("iPhones"))
+        self.assertEqual(len(split_passage("Cards differ in size. iPhones use nano slots here.")), 2)
 
     def test_claim_extraction_skips_non_claims(self):
         text = "Sure! Here is the answer:\n- Supervised learning uses labelled data.\n- It is used for classification tasks.\nWhat else?"

@@ -33,13 +33,13 @@ NO_EVIDENCE_REASONS = {
     "no_relevant_sentence": "No sentence in the retrieved passages was similar enough to this statement.",
 }
 
-st.set_page_config(page_title="Document Chatbot", page_icon="📄", layout="centered")
+st.set_page_config(page_title="Delirium", page_icon="꩜", layout="centered")
 
 
 @st.cache_resource
+@st.cache_resource
 def get_detector() -> HallucinationDetector:
-    """One detector per app process, so the NLI model loads only once."""
-    return HallucinationDetector()
+    return HallucinationDetector(model_name="MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli")
 
 
 def save_uploaded_file(uploaded_file) -> str:
@@ -215,7 +215,7 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 # Main area: chat
 # ---------------------------------------------------------------------------
-st.title("📄 Document Chatbot")
+st.title("꩜ Delirium")
 st.caption("Ask questions about your PDF. Every answer is fact-checked against the document.")
 
 if st.session_state.retriever is None:

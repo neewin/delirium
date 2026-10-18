@@ -40,6 +40,55 @@ _SKIP_PHRASES = ("cannot be determined", "not enough information",
 
 
 # ---------------------------------------------------------------------------
+# Acronym normalisation (used only for NLI and similarity, never for display)
+# ---------------------------------------------------------------------------
+_CONNECTORS = {"of", "the", "and", "for", "to", "in", "on", "a", "an"}
+_LONG_THEN_ACRONYM = re.compile(r"\(([A-Z][A-Z0-9]{1,7})(s?)\)")
+_ACRONYM_THEN_LONG = re.compile(r"\b([A-Z][A-Z0-9]{1,7})(s?)\s+\(([A-Za-z][^()]{3,80})\)")
+
+
+def _initials(words: List[str]) -> str:
+    """Upper-case initials of words, ignoring small connector words."""
+    return "".join(w[0].upper() for w in words if w.lower() not in _CONNECTORS)
+
+
+def normalize_acronyms(text: str) -> str:
+    """Replace 'long form (ACR)' and 'ACR (long form)' with just 'ACR'.
+
+    Example: 'subscriber identity module (SIM) cards' -> 'SIM cards'.
+    The expansion is replaced only when the words' initials really spell the
+    acronym, so ordinary parentheses are left alone. NLI models treat an
+    expanded acronym as new information, which lowers entailment scores.
+    """
+    if not text:
+        return text
+
+    # Pattern 1: long form followed by (ACR). Work right-to-left so indices stay valid.
+    for m in reversed(list(_LONG_THEN_ACRONYM.finditer(text))):
+        acr, plural = m.group(1), m.group(2)
+        words = [(w.group(), w.start()) for w in re.finditer(r"[A-Za-z][A-Za-z0-9-]*", text[:m.start()])]
+        for k in range(len(acr), len(acr) + 4):          # allow a few connector words
+            if k > len(words):
+                break
+            last = words[-k:]
+            if last[0][0].lower() in _CONNECTORS or _initials([w for w, _ in last]) != acr:
+                continue
+            start = last[0][1]
+            if re.search(r"[.!?;:]", text[start:m.start()]):
+                continue                                  # do not cross a sentence boundary
+            text = text[:start] + acr + plural + text[m.end():]
+            break
+
+    # Pattern 2: ACR followed by (long form).
+    def _drop_long_form(m):
+        acr, plural, inner = m.group(1), m.group(2), m.group(3)
+        words = re.findall(r"[A-Za-z][A-Za-z0-9-]*", inner)
+        return acr + plural if _initials(words) == acr else m.group(0)
+
+    return _ACRONYM_THEN_LONG.sub(_drop_long_form, text)
+
+
+# ---------------------------------------------------------------------------
 # Text splitting
 # ---------------------------------------------------------------------------
 def extract_claims(answer: str) -> List[Dict]:
@@ -57,7 +106,7 @@ def extract_claims(answer: str) -> List[Dict]:
         line = line.replace("**", "").replace("__", "").strip()
         if not line:
             continue
-        for sentence in re.split(r"(?<=[.!?])\s+(?=[A-Z0-9\"'(])", line):
+        for sentence in re.split(r"(?<=[.!?])\s+(?=[A-Z0-9\"'(]|[a-z][A-Z])", line):
             s = sentence.strip()
             if len(s.split()) < 4 or s.endswith("?") or s.endswith(":"):
                 continue
@@ -70,7 +119,7 @@ def extract_claims(answer: str) -> List[Dict]:
 
 def _sentences(part: str) -> List[str]:
     """Split text into stripped, non-empty sentences."""
-    return [x.strip() for x in re.split(r"(?<=[.!?])\s+(?=[A-Z0-9\"'(])", part) if x.strip()]
+    return [x.strip() for x in re.split(r"(?<=[.!?])\s+(?=[A-Z0-9\"'(]|[a-z][A-Z])", part) if x.strip()]
 
 
 def split_passage(text: str) -> List[Dict]:
@@ -177,7 +226,7 @@ class HallucinationDetector:
 
     def compare_claim_with_evidence(self, claim: str, evidence_text: str) -> Dict:
         """NLI scores for one claim vs one text (premise=evidence, hypothesis=claim)."""
-        return self._predict_batch([(evidence_text, claim)])[0]
+        return self._predict_batch([(normalize_acronyms(evidence_text), normalize_acronyms(claim))])[0]
 
     # -- embeddings --------------------------------------------------------------
     def _embed(self, texts: List[str]) -> np.ndarray:
@@ -254,7 +303,8 @@ class HallucinationDetector:
             return {"claim": claim, "status": NOT_SUPPORTED,
                     "reason": "no_relevant_sentence", "evidence": []}
 
-        scores = self._predict_batch([(units[i]["window_text"], claim) for i, _ in picked])
+        scores = self._predict_batch([(normalize_acronyms(units[i]["window_text"]),
+                                       normalize_acronyms(claim)) for i, _ in picked])
         scored = []
         for (i, sim), s in zip(picked, scores):
             u = units[i]
@@ -328,8 +378,8 @@ class HallucinationDetector:
         try:
             sims = None
             if extracted and units:
-                unit_vecs = self._embed([u["sentence"] for u in units])
-                claim_vecs = self._embed([c["claim"] for c in extracted])
+                unit_vecs = self._embed([normalize_acronyms(u["sentence"]) for u in units])
+                claim_vecs = self._embed([normalize_acronyms(c["claim"]) for c in extracted])
                 sims = claim_vecs @ unit_vecs.T      # cosine similarities
             for k, item in enumerate(extracted):
                 result = self.classify_claim(item["claim"], units,
