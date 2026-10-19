@@ -15,16 +15,11 @@ for path in (HERE, PROJECT_ROOT):
 
 import streamlit as st
 
-try:
-    from modules.document_processor import process_document
-    from modules.retriever import SemanticRetriever
-    from modules.answer_generator import generate_answer, STATUS_SUCCESS, STATUS_INSUFFICIENT
-    from modules.hallucination_detector import HallucinationDetector
-except ModuleNotFoundError:
-    from Module1.document_processor import process_document
-    from Module2.retriever import SemanticRetriever
-    from Module3.answer_generator import generate_answer, STATUS_SUCCESS, STATUS_INSUFFICIENT
-    from hallucination_detector import HallucinationDetector
+
+from Module1.document_processor import process_document
+from Module2.retriever import SemanticRetriever
+from Module3.answer_generator import generate_answer, STATUS_SUCCESS, STATUS_INSUFFICIENT
+from hallucination_detector import HallucinationDetector
 
 UPLOAD_DIR = os.path.join(PROJECT_ROOT, "uploads")
 TOP_K = 5   # passages retrieved for every question (fixed; change here if needed)
@@ -40,13 +35,16 @@ NO_EVIDENCE_REASONS = {
     "no_relevant_sentence": "No sentence in the retrieved passages was similar enough to this statement.",
 }
 
-st.set_page_config(page_title="Document Chatbot", page_icon="📄", layout="centered")
+st.set_page_config(page_title="Delirium", page_icon="🌀", layout="centered")
 
 
-@st.cache_resource
+@st.cache_resource(show_spinner="Loading the fact-checking model (only needed once per session)...")
 def get_detector() -> HallucinationDetector:
-    """One detector per app process, so the NLI model loads only once."""
-    return HallucinationDetector()
+    """One detector per app process. The NLI model is loaded here, at startup,
+    so the first question is not slowed down by it."""
+    detector = HallucinationDetector(model_name="MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli")      # e.g. HallucinationDetector(model_name="...") to use another model
+    detector.load_model()
+    return detector
 
 
 def save_uploaded_file(uploaded_file) -> str:
@@ -164,6 +162,9 @@ def render_verification(report: dict) -> None:
         with st.expander(f"{STATUS_LABELS.get(c['status'], c['status'])} — {c['claim']}"):
             if c.get("compound"):
                 st.caption("This sentence may contain several statements; it was checked as one.")
+            if c.get("ignored_conflicts"):
+                st.caption("A less relevant passage seemed to disagree and was set aside; "
+                           "the most closely matching passage was used.")
             if not c["evidence"]:
                 st.write(NO_EVIDENCE_REASONS.get(c.get("reason"), "No evidence found."))
             # Best-matching evidence first
@@ -258,6 +259,11 @@ with st.sidebar:
 st.title("🌀Delirium")
 st.caption("Ask questions about your PDF. Every answer is fact-checked against the document.")
 
+try:
+    get_detector()      # preload the fact-checking model now; cached for the rest of the session
+except Exception as e:
+    st.warning(f"The fact-checking model could not be loaded yet: {e}")
+
 if st.session_state.retriever is None:
     st.info("👈 Upload a PDF in the sidebar and click **Process document** to begin.")
 
@@ -284,7 +290,7 @@ if question:
                 result = generate_answer(question, retrieved)
             report = None
             if result["status"] in (STATUS_SUCCESS, STATUS_INSUFFICIENT):
-                with st.spinner("Fact-checking the answer (first run downloads a model)..."):
+                with st.spinner("Fact-checking the answer..."):
                     detector = get_detector()
                     detector.embedder = st.session_state.retriever.model
                     report = detector.verify_answer(question, result["answer"], retrieved)
