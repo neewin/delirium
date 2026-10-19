@@ -15,31 +15,38 @@ for path in (HERE, PROJECT_ROOT):
 
 import streamlit as st
 
-from Module1.document_processor import process_document
-from Module2.retriever import SemanticRetriever
-from Module3.answer_generator import generate_answer, STATUS_SUCCESS, STATUS_INSUFFICIENT
-from hallucination_detector import HallucinationDetector
+try:
+    from modules.document_processor import process_document
+    from modules.retriever import SemanticRetriever
+    from modules.answer_generator import generate_answer, STATUS_SUCCESS, STATUS_INSUFFICIENT
+    from modules.hallucination_detector import HallucinationDetector
+except ModuleNotFoundError:
+    from Module1.document_processor import process_document
+    from Module2.retriever import SemanticRetriever
+    from Module3.answer_generator import generate_answer, STATUS_SUCCESS, STATUS_INSUFFICIENT
+    from hallucination_detector import HallucinationDetector
 
 UPLOAD_DIR = os.path.join(PROJECT_ROOT, "uploads")
+TOP_K = 5   # passages retrieved for every question (fixed; change here if needed)
 
 STATUS_LABELS = {
-    "supported": "✅ Supported",
-    "contradicted": "❌ Contradicted",
-    "not_supported": "⚠️ Not supported",
-    "conflicting_evidence": "🔀 Conflicting evidence",
+    "supported": "✅ Confirmed by the document",
+    "contradicted": "❌ Conflicts with the document",
+    "not_supported": "⚠️ Not confirmed by the document",
+    "conflicting_evidence": "🔀 The document gives mixed signals",
 }
 NO_EVIDENCE_REASONS = {
     "insufficient_evidence": "No evidence passages were available.",
     "no_relevant_sentence": "No sentence in the retrieved passages was similar enough to this statement.",
 }
 
-st.set_page_config(page_title="Delirium", page_icon="꩜", layout="centered")
+st.set_page_config(page_title="Document Chatbot", page_icon="📄", layout="centered")
 
 
-@st.cache_resource
 @st.cache_resource
 def get_detector() -> HallucinationDetector:
-    return HallucinationDetector(model_name="MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli")
+    """One detector per app process, so the NLI model loads only once."""
+    return HallucinationDetector()
 
 
 def save_uploaded_file(uploaded_file) -> str:
@@ -87,10 +94,28 @@ def render_answer(answer: str, report) -> None:
     with st.container(border=True):
         st.markdown(body, unsafe_allow_html=True)
     if highlighted:
-        st.caption("Highlights: 🟩 supported · 🟨 not supported · 🟥 contradicted · 🟪 conflicting "
+        st.caption("Highlights: 🟩 confirmed · 🟨 not confirmed · 🟥 conflicts · 🟪 mixed "
                    "(hover a highlight to see its status)")
     with st.expander("📋 Copy as plain text"):
         st.code(answer, language=None)
+
+
+def describe_evidence(e: dict):
+    """Turn the model's scores into a plain-language verdict and topic-match label."""
+    confirms, opposes = e["entailment_score"], e["contradiction_score"]
+    if opposes >= 0.8:
+        verdict = "❌ This passage says the opposite."
+    elif confirms >= 0.8:
+        verdict = "✅ This passage clearly confirms the statement."
+    elif confirms >= 0.5:
+        verdict = "🟡 This passage partly confirms it, but not clearly enough."
+    elif opposes >= 0.5:
+        verdict = "🟠 This passage may conflict with the statement."
+    else:
+        verdict = "⚪ This passage is related but does not confirm the statement."
+    sim = e.get("similarity", 0)
+    relevance = "very relevant" if sim >= 0.75 else "relevant" if sim >= 0.5 else "loosely related"
+    return verdict, relevance
 
 
 def render_sources(sources: list) -> None:
@@ -128,11 +153,11 @@ def render_verification(report: dict) -> None:
 
     st.progress(supported / total)
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Supported", supported)
-    c2.metric("Contradicted", s["contradicted"])
-    c3.metric("Not supported", s["not_supported"])
-    c4.metric("Conflicting", s["conflicting_evidence"])
-    st.caption("This is an automated estimate, not a guarantee. 'Not supported' means the document "
+    c1.metric("Confirmed", supported)
+    c2.metric("Conflicts", s["contradicted"])
+    c3.metric("Not confirmed", s["not_supported"])
+    c4.metric("Mixed", s["conflicting_evidence"])
+    st.caption("This is an automated estimate, not a guarantee. 'Not confirmed' means the document "
                "does not confirm the statement; it does not mean the statement is false.")
 
     for i, c in enumerate(report["claims"], start=1):
@@ -145,9 +170,17 @@ def render_verification(report: dict) -> None:
             for e in sorted(c["evidence"], key=lambda e: -e.get("similarity", 0)):
                 st.markdown(f"**📄 {e['source']} — page {e['page']}**")
                 st.markdown(f"> {e['text']}")
-                st.caption(f"match {e['similarity']:.2f} · supports {e['entailment_score']:.2f} · "
-                           f"contradicts {e['contradiction_score']:.2f} · unrelated {e['neutral_score']:.2f}"
-                           + (" · passage truncated for the model" if e.get("truncated") else ""))
+                verdict, relevance = describe_evidence(e)
+                st.markdown(f"{verdict}  \n*Topic match: {relevance}*")
+                confirms = min(max(e["entailment_score"], 0.0), 1.0)
+                st.progress(confirms, text=f"Confirms the statement: {confirms:.0%}")
+                if e.get("truncated"):
+                    st.caption("This passage was long, so only its first part was checked.")
+                if st.session_state.get("show_technical"):
+                    st.caption(f"Technical scores: match {e['similarity']:.2f} · "
+                               f"supports {e['entailment_score']:.2f} · "
+                               f"contradicts {e['contradiction_score']:.2f} · "
+                               f"unrelated {e['neutral_score']:.2f}")
 
 
 def render_assistant(msg: dict) -> None:
@@ -205,9 +238,16 @@ with st.sidebar:
         m2.metric("Chunks", num_chunks)
 
     st.divider()
-    top_k = st.slider("Passages to retrieve", 1, 10, 3,
-                      help="How many passages are searched for each question. Use more for broad "
-                           "questions that cover several sections.")
+    st.checkbox("Show technical scores", key="show_technical",
+                help="Adds the raw model scores under each piece of evidence.")
+    with st.expander("ℹ️ How to read the results"):
+        st.markdown(
+            "- **Highlights** in the answer show how well the document backs each sentence.\n"
+            "- **Confirmed**: a passage in your document says the same thing.\n"
+            "- **Not confirmed**: the document does not clearly say this. It may still be true.\n"
+            "- **Conflicts**: a passage says something different.\n"
+            "- **Topic match** shows how closely a passage relates to the statement.\n"
+            "- This is an automated check and can be wrong. Open the evidence to verify.")
     if st.button("🗑️ Clear conversation", use_container_width=True):
         st.session_state.history = []
         st.rerun()
@@ -215,7 +255,7 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 # Main area: chat
 # ---------------------------------------------------------------------------
-st.title("꩜ Delirium")
+st.title("🌀Delirium")
 st.caption("Ask questions about your PDF. Every answer is fact-checked against the document.")
 
 if st.session_state.retriever is None:
@@ -239,7 +279,7 @@ if question:
     with st.chat_message("assistant"):
         try:
             with st.spinner("Searching the document..."):
-                retrieved = st.session_state.retriever.search(question, top_k=top_k)
+                retrieved = st.session_state.retriever.search(question, top_k=TOP_K)
             with st.spinner("Writing the answer..."):
                 result = generate_answer(question, retrieved)
             report = None
