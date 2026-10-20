@@ -15,11 +15,16 @@ for path in (HERE, PROJECT_ROOT):
 
 import streamlit as st
 
-
-from Module1.document_processor import process_document
-from Module2.retriever import SemanticRetriever
-from Module3.answer_generator import generate_answer, STATUS_SUCCESS, STATUS_INSUFFICIENT
-from hallucination_detector import HallucinationDetector
+try:
+    from modules.document_processor import process_document
+    from modules.retriever import SemanticRetriever
+    from modules.answer_generator import generate_answer, STATUS_SUCCESS, STATUS_INSUFFICIENT
+    from modules.hallucination_detector import HallucinationDetector
+except ModuleNotFoundError:
+    from Module1.document_processor import process_document
+    from Module2.retriever import SemanticRetriever
+    from Module3.answer_generator import generate_answer, STATUS_SUCCESS, STATUS_INSUFFICIENT
+    from hallucination_detector import HallucinationDetector
 
 UPLOAD_DIR = os.path.join(PROJECT_ROOT, "uploads")
 TOP_K = 5   # passages retrieved for every question (fixed; change here if needed)
@@ -42,7 +47,7 @@ st.set_page_config(page_title="Delirium", page_icon="🌀", layout="centered")
 def get_detector() -> HallucinationDetector:
     """One detector per app process. The NLI model is loaded here, at startup,
     so the first question is not slowed down by it."""
-    detector = HallucinationDetector(model_name="MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli")      # e.g. HallucinationDetector(model_name="...") to use another model
+    detector = HallucinationDetector()      # e.g. HallucinationDetector(model_name="...") to use another model
     detector.load_model()
     return detector
 
@@ -101,6 +106,11 @@ def render_answer(answer: str, report) -> None:
 def describe_evidence(e: dict):
     """Turn the model's scores into a plain-language verdict and topic-match label."""
     confirms, opposes = e["entailment_score"], e["contradiction_score"]
+    sim = e.get("similarity", 0)
+    relevance = "very relevant" if sim >= 0.75 else "relevant" if sim >= 0.5 else "loosely related"
+    if e.get("list_item") and confirms < 0.5:
+        # One entry in a bullet list names one item; it says nothing about the other items.
+        return "⚪ This is a different entry in a list, so it does not confirm the statement.", relevance
     if opposes >= 0.8:
         verdict = "❌ This passage says the opposite."
     elif confirms >= 0.8:
@@ -111,8 +121,6 @@ def describe_evidence(e: dict):
         verdict = "🟠 This passage may conflict with the statement."
     else:
         verdict = "⚪ This passage is related but does not confirm the statement."
-    sim = e.get("similarity", 0)
-    relevance = "very relevant" if sim >= 0.75 else "relevant" if sim >= 0.5 else "loosely related"
     return verdict, relevance
 
 
@@ -159,7 +167,10 @@ def render_verification(report: dict) -> None:
                "does not confirm the statement; it does not mean the statement is false.")
 
     for i, c in enumerate(report["claims"], start=1):
-        with st.expander(f"{STATUS_LABELS.get(c['status'], c['status'])} — {c['claim']}"):
+        label = STATUS_LABELS.get(c["status"], c["status"])
+        if c["status"] == "not_supported" and any(e["entailment_score"] >= 0.5 for e in c["evidence"]):
+            label = "🟡 Only partly confirmed by the document"
+        with st.expander(f"{label} — {c['claim']}"):
             if c.get("compound"):
                 st.caption("This sentence may contain several statements; it was checked as one.")
             if c.get("ignored_conflicts"):

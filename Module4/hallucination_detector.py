@@ -22,6 +22,7 @@ CONTRADICTION_THRESHOLD = 0.80
 MIN_SIMILARITY = 0.35                   # a sentence must be at least this similar to a claim
 TOP_K_SENTENCES = 3                     # max evidence sentences checked per claim
 CONTEXT_WINDOW = 1                      # neighbouring sentences added to each premise
+CONFLICT_MARGIN = 0.10                  # when passages disagree, the clearly more relevant side wins
 MAX_LENGTH = 512                        # NLI model input limit (tokens)
 BATCH_SIZE = 8
 
@@ -32,6 +33,10 @@ NOT_SUPPORTED = "not_supported"
 CONFLICTING = "conflicting_evidence"
 
 _BULLETS = "\u25E6\u2022\u25CF\u25AA\u2023\u25A0\u2043"   # bullet characters in PDFs
+# A list entry such as "Android: Based on the Linux kernel..." stands on its own.
+_LABEL_ITEM = re.compile(r"^[A-Z0-9][^:.!?]{0,60}:\s+\S")
+# Words that let a single list entry rule something out ("... are not stored").
+_NEGATION = re.compile(r"\b(not|no|never|cannot|can't|without|only|none|neither|nor)\b", re.I)
 _SKIP_START = re.compile(
     r"^(hi|hello|hey|sure|certainly|of course|thanks|thank you|i hope|"
     r"let me know|here is|here's|based on|according to the)\b", re.I)
@@ -129,7 +134,9 @@ def split_passage(text: str) -> List[Dict]:
     to the lead-in sentence before the list ("... required to create reports,
     such as" + "a formal report ..."), so every item is a complete statement
     and keeps its meaning. Such units are 'standalone': no neighbouring items
-    are added to them later. Other sentences are ordinary units.
+    are added to them later. 'Label: description' entries (e.g. "Android: Based on...")
+    are standalone too, so a list of different items is never fed to the NLI model as
+    one premise. Other sentences are ordinary units.
     """
     parts = re.split(f"[{_BULLETS}]", text)
     units: List[Dict] = []
@@ -140,16 +147,19 @@ def split_passage(text: str) -> List[Dict]:
         lead = first.pop()               # last fragment before the list = lead-in
     for sentence in first:
         if len(sentence.split()) >= 3:
-            units.append({"text": sentence, "standalone": False})
+            units.append({"text": sentence, "standalone": bool(_LABEL_ITEM.match(sentence)),
+                          "list_item": False})
 
     for part in parts[1:]:
         sents = _sentences(part)
         if not sents:
             continue
-        units.append({"text": f"{lead} {sents[0]}".strip(), "standalone": True})
+        units.append({"text": f"{lead} {sents[0]}".strip(), "standalone": True,
+                      "list_item": True})
         for sentence in sents[1:]:       # text that follows the last bullet
             if len(sentence.split()) >= 3:
-                units.append({"text": sentence, "standalone": False})
+                units.append({"text": sentence, "standalone": bool(_LABEL_ITEM.match(sentence)),
+                          "list_item": False})
     return units
 
 
@@ -165,6 +175,7 @@ class HallucinationDetector:
                  min_similarity: float = MIN_SIMILARITY,
                  top_k: int = TOP_K_SENTENCES,
                  context_window: int = CONTEXT_WINDOW,
+                 conflict_margin: float = CONFLICT_MARGIN,
                  embedder=None):
         self.model_name = model_name
         self.entailment_threshold = entailment_threshold
@@ -172,6 +183,7 @@ class HallucinationDetector:
         self.min_similarity = min_similarity
         self.top_k = top_k
         self.context_window = context_window
+        self.conflict_margin = conflict_margin
         self.embedder = embedder          # a SentenceTransformer (e.g. retriever.model)
         self.tokenizer = None
         self.model = None
@@ -276,6 +288,7 @@ class HallucinationDetector:
                 units.append({
                     "source": e["source"], "page": e["page"], "chunk_id": e["chunk_id"],
                     "sentence": item["text"], "window_text": window,
+                    "list_item": item.get("list_item", False),
                 })
         return units
 
@@ -287,7 +300,8 @@ class HallucinationDetector:
         1. Semantic gate: keep up to top_k sentences with similarity >= min_similarity.
         2. NLI on each kept sentence (premise) vs the claim (hypothesis).
         3. Rules (T_e / T_c = thresholds):
-           entailed >= T_e AND contradicted >= T_c -> conflicting_evidence
+           entailed >= T_e AND contradicted >= T_c -> the more relevant (similar) side wins
+                                                      if clearly ahead, else conflicting_evidence
            entailed >= T_e                         -> supported
            contradicted >= T_c                     -> contradicted
            otherwise                               -> not_supported
@@ -316,13 +330,30 @@ class HallucinationDetector:
                 "contradiction_score": s["contradiction"],
                 "neutral_score": s["neutral"],
                 "truncated": s.get("truncated", False),
+                "list_item": u["list_item"],
             })
 
         entail = [s for s in scored if s["entailment_score"] >= self.entailment_threshold]
-        contra = [s for s in scored if s["contradiction_score"] >= self.contradiction_threshold]
+        # One bullet entry only names ONE item; it does not exclude other items, so a
+        # bullet entry can confirm a claim but cannot contradict it (unless it contains a negation).
+        contra = [s for s in scored
+                  if s["contradiction_score"] >= self.contradiction_threshold
+                  and not (s["list_item"] and not _NEGATION.search(s["text"]))]
 
+        ignored = 0
         if entail and contra:
-            status, used = CONFLICTING, entail + contra
+            # Passages disagree: the clearly more relevant side wins; if they are
+            # about equally relevant, report conflicting evidence.
+            gap = (max(s["similarity"] for s in entail)
+                   - max(s["similarity"] for s in contra))
+            if gap >= self.conflict_margin:
+                status, ignored = SUPPORTED, len(contra)
+                used = sorted(entail, key=lambda s: -s["entailment_score"])
+            elif -gap >= self.conflict_margin:
+                status, ignored = CONTRADICTED, len(entail)
+                used = sorted(contra, key=lambda s: -s["contradiction_score"])
+            else:
+                status, used = CONFLICTING, entail + contra
         elif entail:
             status, used = SUPPORTED, sorted(entail, key=lambda s: -s["entailment_score"])
         elif contra:
@@ -330,7 +361,8 @@ class HallucinationDetector:
         else:
             # Show every candidate that was checked; none met a threshold.
             status, used = NOT_SUPPORTED, sorted(scored, key=lambda s: -s["entailment_score"])
-        return {"claim": claim, "status": status, "evidence": used}
+        return {"claim": claim, "status": status, "evidence": used,
+                "ignored_conflicts": ignored}
 
     # -- summary ------------------------------------------------------------------
     @staticmethod
