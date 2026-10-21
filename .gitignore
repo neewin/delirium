@@ -4,3 +4,11 @@ __pycache__/
 *.pyc
 uploads/
 data/
+diag_nli.py
+evaluate.py
+eval/
+eval_output/
+eval_output_base/
+eval_output_fp32/
+test_evaluate.py
+evaluate.py

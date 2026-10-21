@@ -198,6 +198,9 @@ class HallucinationDetector:
             from transformers import AutoTokenizer, AutoModelForSequenceClassification
             self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
             self.model = AutoModelForSequenceClassification.from_pretrained(self.model_name)
+            # Run in float32. Some checkpoints load in half precision (float16), which can
+            # give unreliable, noisy scores on a CPU.
+            self.model = self.model.float()
             self.model.eval()
         except Exception as exc:
             self.model = None
