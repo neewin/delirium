@@ -12,6 +12,7 @@ verdict. Results are automated estimates, not ground truth.
 
 import os
 import re
+import threading
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -32,6 +33,11 @@ CONTEXT_WINDOW = 1                      # neighbouring sentences added to each p
 CONFLICT_MARGIN = 0.10                  # when passages disagree, the clearly more relevant side wins
 MAX_LENGTH = 512                        # NLI model input limit (tokens)
 BATCH_SIZE = 8
+
+def configured_model_name() -> str:
+    """NLI model name: NLI_MODEL from .env / environment, else the default."""
+    return os.getenv("NLI_MODEL") or NLI_MODEL_NAME
+
 
 # Statuses
 SUPPORTED = "supported"
@@ -185,7 +191,7 @@ class HallucinationDetector:
                  conflict_margin: float = CONFLICT_MARGIN,
                  embedder=None):
         # Priority: explicit argument, then NLI_MODEL in .env / environment, then the default.
-        self.model_name = model_name or os.getenv("NLI_MODEL") or NLI_MODEL_NAME
+        self.model_name = model_name or configured_model_name()
         self.entailment_threshold = entailment_threshold
         self.contradiction_threshold = contradiction_threshold
         self.min_similarity = min_similarity
@@ -212,7 +218,11 @@ class HallucinationDetector:
             self.model.eval()
         except Exception as exc:
             self.model = None
-            raise RuntimeError(f"Could not load NLI model '{self.model_name}': {exc}")
+            hint = ""
+            if os.environ.get("HF_HUB_OFFLINE") == "1":
+                hint = (" (offline mode is on: run `python download_models.py` once, "
+                        "or set ALLOW_MODEL_DOWNLOAD=1 to allow downloads)")
+            raise RuntimeError(f"Could not load NLI model '{self.model_name}': {exc}{hint}")
 
         # Never assume label order: read it from the model config.
         id2label = {int(i): str(l).lower() for i, l in self.model.config.id2label.items()}
@@ -444,3 +454,51 @@ class HallucinationDetector:
                              "overall_status": "verification_failed"}
         report["error"] = message
         return report
+
+
+# ---------------------------------------------------------------------------
+# One shared detector, loadable in the background (used by the Streamlit app)
+# ---------------------------------------------------------------------------
+_shared: Optional[HallucinationDetector] = None
+_load_lock = threading.Lock()      # held while the model loads
+_start_lock = threading.Lock()     # protects the 'started' flag only (never blocks the UI)
+_started = False
+
+
+def get_shared_detector() -> HallucinationDetector:
+    """Return the one shared detector, loading its model first if needed.
+    If a background load is running, this waits for it instead of loading twice."""
+    global _shared
+    with _load_lock:
+        if _shared is None:
+            detector = HallucinationDetector()
+            detector.load_model()
+            _shared = detector
+    return _shared
+
+
+def preload_in_background(also_run=None) -> None:
+    """Start loading the NLI model in a background thread (once per process).
+
+    also_run: optional function run first in the same thread (e.g. importing the
+    heavy retrieval libraries). Errors are not raised here; they appear, with
+    their message, the first time the detector is actually needed.
+    """
+    global _started
+    with _start_lock:
+        if _started:
+            return
+        _started = True
+
+    def work():
+        try:
+            if also_run:
+                also_run()
+        except Exception:
+            pass
+        try:
+            get_shared_detector()
+        except Exception:
+            pass
+
+    threading.Thread(target=work, daemon=True).start()

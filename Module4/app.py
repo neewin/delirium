@@ -7,6 +7,11 @@ Works with both layouts: modules/ folder, or Module1..Module4 folders.
 import os
 import sys
 
+# Models are already downloaded, so skip the slow Hugging Face network checks at startup.
+# For a first-time download, run `python download_models.py` or set ALLOW_MODEL_DOWNLOAD=1.
+if os.environ.get("ALLOW_MODEL_DOWNLOAD") != "1":
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = HERE if os.path.isdir(os.path.join(HERE, "modules")) else os.path.dirname(HERE)
 for path in (HERE, PROJECT_ROOT):
@@ -17,9 +22,18 @@ import streamlit as st
 
 
 from Module1.document_processor import process_document
-from Module2.retriever import SemanticRetriever
 from Module3.answer_generator import generate_answer, STATUS_SUCCESS, STATUS_INSUFFICIENT
-from hallucination_detector import HallucinationDetector
+from hallucination_detector import (HallucinationDetector, get_shared_detector,
+                                        preload_in_background, configured_model_name)
+
+
+def load_retriever_class():
+    """Import the retriever lazily: it pulls in torch and sentence-transformers, which are slow
+    to import. The page appears first; this runs in the background or on first use."""
+    
+    from Module2.retriever import SemanticRetriever
+    return SemanticRetriever
+
 
 UPLOAD_DIR = os.path.join(PROJECT_ROOT, "uploads")
 TOP_K = 5   # passages retrieved for every question (fixed; change here if needed)
@@ -38,13 +52,9 @@ NO_EVIDENCE_REASONS = {
 st.set_page_config(page_title="Delirium", page_icon="🌀", layout="centered")
 
 
-@st.cache_resource(show_spinner="Loading the fact-checking model (only needed once per session)...")
 def get_detector() -> HallucinationDetector:
-    """One detector per app process. The NLI model is loaded here, at startup,
-    so the first question is not slowed down by it."""
-    detector = HallucinationDetector()      # model comes from NLI_MODEL in .env, else the default
-    detector.load_model()
-    return detector
+    """The shared detector. Its model loads in the background from startup; this waits if needed."""
+    return get_shared_detector()
 
 
 def save_uploaded_file(uploaded_file) -> str:
@@ -227,7 +237,7 @@ with st.sidebar:
                 st.write("Reading and chunking the PDF...")
                 chunks = process_document(pdf_path)
                 st.write("Building the search index (first run downloads a model)...")
-                retriever = SemanticRetriever()
+                retriever = load_retriever_class()()
                 retriever.build_index(chunks)
                 status.update(label="Document ready", state="complete", expanded=False)
             st.session_state.retriever = retriever
@@ -265,11 +275,8 @@ with st.sidebar:
 st.title("🌀Delirium")
 st.caption("Ask questions about your PDF. Every answer is fact-checked against the document.")
 
-try:
-    # Preload the fact-checking model now (cached for the session) and show which one is active.
-    st.caption(f"🔎 Fact-checking model: {get_detector().model_name}")
-except Exception as e:
-    st.warning(f"The fact-checking model could not be loaded yet: {e}")
+preload_in_background(also_run=load_retriever_class)   # models load in the background
+st.caption(f"🔎 Fact-checking model: {configured_model_name()}")
 
 if st.session_state.retriever is None:
     st.info("👈 Upload a PDF in the sidebar and click **Process document** to begin.")
