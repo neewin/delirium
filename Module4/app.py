@@ -15,16 +15,11 @@ for path in (HERE, PROJECT_ROOT):
 
 import streamlit as st
 
-try:
-    from modules.document_processor import process_document
-    from modules.retriever import SemanticRetriever
-    from modules.answer_generator import generate_answer, STATUS_SUCCESS, STATUS_INSUFFICIENT
-    from modules.hallucination_detector import HallucinationDetector
-except ModuleNotFoundError:
-    from Module1.document_processor import process_document
-    from Module2.retriever import SemanticRetriever
-    from Module3.answer_generator import generate_answer, STATUS_SUCCESS, STATUS_INSUFFICIENT
-    from hallucination_detector import HallucinationDetector
+
+from Module1.document_processor import process_document
+from Module2.retriever import SemanticRetriever
+from Module3.answer_generator import generate_answer, STATUS_SUCCESS, STATUS_INSUFFICIENT
+from hallucination_detector import HallucinationDetector
 
 UPLOAD_DIR = os.path.join(PROJECT_ROOT, "uploads")
 TOP_K = 5   # passages retrieved for every question (fixed; change here if needed)
@@ -47,7 +42,7 @@ st.set_page_config(page_title="Delirium", page_icon="🌀", layout="centered")
 def get_detector() -> HallucinationDetector:
     """One detector per app process. The NLI model is loaded here, at startup,
     so the first question is not slowed down by it."""
-    detector = HallucinationDetector()      # e.g. HallucinationDetector(model_name="...") to use another model
+    detector = HallucinationDetector()      # model comes from NLI_MODEL in .env, else the default
     detector.load_model()
     return detector
 
@@ -271,7 +266,8 @@ st.title("🌀Delirium")
 st.caption("Ask questions about your PDF. Every answer is fact-checked against the document.")
 
 try:
-    get_detector()      # preload the fact-checking model now; cached for the rest of the session
+    # Preload the fact-checking model now (cached for the session) and show which one is active.
+    st.caption(f"🔎 Fact-checking model: {get_detector().model_name}")
 except Exception as e:
     st.warning(f"The fact-checking model could not be loaded yet: {e}")
 

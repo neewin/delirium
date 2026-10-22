@@ -10,10 +10,17 @@ Similarity is used only to pick candidate evidence, never to decide the
 verdict. Results are automated estimates, not ground truth.
 """
 
+import os
 import re
 from typing import Dict, List, Optional
 
 import numpy as np
+
+try:                                  # lets NLI_MODEL be set in the project's .env file
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 NLI_MODEL_NAME = "cross-encoder/nli-deberta-v3-small"
 EMBED_MODEL_NAME = "all-MiniLM-L6-v2"   # same model as Module 2
@@ -169,7 +176,7 @@ def split_passage(text: str) -> List[Dict]:
 class HallucinationDetector:
     """Verifies answer claims against evidence sentences using NLI."""
 
-    def __init__(self, model_name: str = NLI_MODEL_NAME,
+    def __init__(self, model_name: Optional[str] = None,
                  entailment_threshold: float = ENTAILMENT_THRESHOLD,
                  contradiction_threshold: float = CONTRADICTION_THRESHOLD,
                  min_similarity: float = MIN_SIMILARITY,
@@ -177,7 +184,8 @@ class HallucinationDetector:
                  context_window: int = CONTEXT_WINDOW,
                  conflict_margin: float = CONFLICT_MARGIN,
                  embedder=None):
-        self.model_name = model_name
+        # Priority: explicit argument, then NLI_MODEL in .env / environment, then the default.
+        self.model_name = model_name or os.getenv("NLI_MODEL") or NLI_MODEL_NAME
         self.entailment_threshold = entailment_threshold
         self.contradiction_threshold = contradiction_threshold
         self.min_similarity = min_similarity
