@@ -1,7 +1,7 @@
 .env
 venv/
-__pycache__/
-*.pyc
+pycache/
+*.py[cod]
 uploads/
 data/
 diag_nli.py
