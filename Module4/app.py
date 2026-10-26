@@ -30,7 +30,6 @@ from hallucination_detector import (HallucinationDetector, get_shared_detector,
 def load_retriever_class():
     """Import the retriever lazily: it pulls in torch and sentence-transformers, which are slow
     to import. The page appears first; this runs in the background or on first use."""
-    
     from Module2.retriever import SemanticRetriever
     return SemanticRetriever
 
