@@ -6,6 +6,8 @@ Optional real-model test: python tests/test_hallucination_detector.py --live
 import os
 import re
 import sys
+import threading
+import time
 import unittest
 import zlib
 from unittest.mock import patch
@@ -15,8 +17,11 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))   # project root
 sys.path.insert(0, HERE)
-                  # Module4/ folder layout
+                 # Module4/ folder layout
 from hallucination_detector import HallucinationDetector, extract_claims, split_passage, normalize_acronyms
+
+
+import hallucination_detector as hd
 
 
 class FakeEmbedder:
@@ -94,11 +99,26 @@ class TestDetector(unittest.TestCase):
         r = make().verify_answer("Q?", "The method was invented in Mars colonies.", [CHUNK])
         self.assertEqual(r["claims"][0]["status"], "not_supported")
 
-    def test_conflicting_evidence(self):
-        bad = dict(CHUNK, chunk_id=13, text="Supervised learning uses labelled data, but this contradicts it.")
+    def test_conflicting_evidence_when_equally_relevant(self):
+        bad = dict(CHUNK, chunk_id=13, text="Supervised learning uses labelled data contradicts.")
         r = make().verify_answer("Q?", CLAIM, [CHUNK, bad])
         self.assertEqual(r["claims"][0]["status"], "conflicting_evidence")
         self.assertEqual(len(r["claims"][0]["evidence"]), 2)
+
+    def test_more_relevant_support_beats_less_relevant_contradiction(self):
+        weak_bad = dict(CHUNK, chunk_id=13, text="Supervised learning uses labelled data, but this contradicts it.")
+        r = make().verify_answer("Q?", CLAIM, [CHUNK, weak_bad])
+        self.assertEqual(r["claims"][0]["status"], "supported")
+        self.assertEqual(r["claims"][0]["ignored_conflicts"], 1)
+        self.assertEqual(len(r["claims"][0]["evidence"]), 1)
+
+    def test_more_relevant_contradiction_beats_less_relevant_support(self):
+        weak_good = dict(CHUNK, chunk_id=15,
+                         text="Supervised learning uses labelled examples and many other things today.")
+        strong_bad = dict(CHUNK, chunk_id=16, text="Supervised learning uses labelled data contradicts.")
+        r = make().verify_answer("Q?", CLAIM, [weak_good, strong_bad])
+        self.assertEqual(r["claims"][0]["status"], "contradicted")
+        self.assertEqual(r["claims"][0]["ignored_conflicts"], 1)
 
     def test_offtopic_passage_is_ignored(self):
         offtopic = dict(CHUNK, chunk_id=14, text="Report structure contradicts everything entirely.")
@@ -184,6 +204,76 @@ class TestDetector(unittest.TestCase):
         self.assertEqual(len(claims), 2)
         self.assertTrue(claims[1].startswith("iPhones"))
         self.assertEqual(len(split_passage("Cards differ in size. iPhones use nano slots here.")), 2)
+
+    def test_label_description_entries_are_standalone(self):
+        text = ("Windows Mobile: A now-discontinued OS from Microsoft designed for mobile devices. "
+                "RIM OS: The operating system used by BlackBerry devices, also less common now. "
+                "Android: Based on the Linux kernel, it is an open-source OS.")
+        units = split_passage(text)
+        self.assertEqual(len(units), 3)
+        self.assertTrue(all(u["standalone"] for u in units))
+        built = make().build_units(make().prepare_evidence([dict(CHUNK, text=text)]))
+        self.assertNotIn("Android", built[0]["window_text"])
+        self.assertNotIn("RIM OS", built[0]["window_text"])
+
+    def test_bullet_entry_cannot_contradict_a_claim_about_another_item(self):
+        claim = "Voice recordings might be stored on it."
+        lst = dict(CHUNK, text="The following data might be stored on it: \u25e6Voice recordings contradicts")
+        r = make().verify_answer("Q?", claim, [lst])
+        self.assertEqual(r["claims"][0]["status"], "not_supported")
+        self.assertTrue(r["claims"][0]["evidence"][0]["list_item"])
+
+    def test_normal_sentence_can_still_contradict(self):
+        claim = "Voice recordings might be stored on it."
+        plain = dict(CHUNK, text="Voice recordings might be stored on it, this contradicts.")
+        r = make().verify_answer("Q?", claim, [plain])
+        self.assertEqual(r["claims"][0]["status"], "contradicted")
+
+    def test_bullet_entry_with_negation_can_contradict(self):
+        claim = "Voice recordings might be stored on it."
+        neg = dict(CHUNK, text="The following data might be stored on it: \u25e6Voice recordings not stored contradicts")
+        r = make().verify_answer("Q?", claim, [neg])
+        self.assertEqual(r["claims"][0]["status"], "contradicted")
+
+    def test_model_name_comes_from_environment(self):
+        with patch.dict(os.environ, {"NLI_MODEL": "some/custom-nli"}):
+            self.assertEqual(HallucinationDetector().model_name, "some/custom-nli")
+            self.assertEqual(HallucinationDetector(model_name="explicit/one").model_name, "explicit/one")
+        with patch.dict(os.environ):
+            os.environ.pop("NLI_MODEL", None)
+            self.assertEqual(HallucinationDetector().model_name, "cross-encoder/nli-deberta-v3-small")
+
+    def test_shared_detector_is_created_once(self):
+        hd._shared = None
+        with patch.object(hd.HallucinationDetector, "load_model", return_value=None):
+            a, b = hd.get_shared_detector(), hd.get_shared_detector()
+        self.assertIs(a, b)
+        hd._shared = None
+
+    def test_background_preload_runs_once(self):
+        hd._shared, hd._started = None, False
+        calls, done = [], threading.Event()
+
+        def also():
+            calls.append(1)
+            done.set()
+
+        with patch.object(hd.HallucinationDetector, "load_model", return_value=None):
+            hd.preload_in_background(also)
+            hd.preload_in_background(also)
+            self.assertTrue(done.wait(2))
+            for _ in range(40):                 # wait for the thread to finish inside the patch
+                if hd._shared is not None:
+                    break
+                time.sleep(0.05)
+        self.assertEqual(calls, [1])
+        self.assertIsNotNone(hd._shared)
+        hd._shared, hd._started = None, False
+
+    def test_ordinary_sentences_still_share_context(self):
+        built = make().build_units(make().prepare_evidence(
+            [dict(CHUNK, text="Alpha beta gamma delta here. Epsilon zeta eta theta there.")]))
+        self.assertIn("Epsilon", built[0]["window_text"])
 
     def test_claim_extraction_skips_non_claims(self):
         text = "Sure! Here is the answer:\n- Supervised learning uses labelled data.\n- It is used for classification tasks.\nWhat else?"
